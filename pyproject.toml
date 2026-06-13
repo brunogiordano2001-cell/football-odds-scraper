@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "football-odds-scraper"
+version = "0.1.0"
+description = "Async football odds scraper (1X2 and Over/Under 2.5) with overround removal"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "playwright>=1.40.0",
+    "beautifulsoup4>=4.12.0",
+    "lxml>=5.0.0",
+    "numpy>=1.24.0",
+    "scipy>=1.10.0",
+    "pandas>=2.0.0",
+    "tqdm>=4.66.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0", "pytest-asyncio>=0.23"]
+app = ["streamlit>=1.28.0", "plotly>=5.18.0", "requests>=2.31.0"]
+
+[project.scripts]
+football-odds = "football_odds_scraper.cli:main"
+football-backtest = "football_odds_scraper.backtest:main"
+football-advanced-backtest = "football_odds_scraper.advanced_backtester:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["football_odds_scraper*"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"

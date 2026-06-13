@@ -1,0 +1,4 @@
+[console_scripts]
+football-advanced-backtest = football_odds_scraper.advanced_backtester:main
+football-backtest = football_odds_scraper.backtest:main
+football-odds = football_odds_scraper.cli:main
