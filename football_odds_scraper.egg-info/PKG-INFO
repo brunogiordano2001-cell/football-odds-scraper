@@ -17,7 +17,7 @@ Requires-Dist: pytest-asyncio>=0.23; extra == "dev"
 Provides-Extra: app
 Requires-Dist: streamlit>=1.28.0; extra == "app"
 Requires-Dist: plotly>=5.18.0; extra == "app"
-Requires-Dist: playwright-stealth>=1.0.6; extra == "app"
+Requires-Dist: requests>=2.31.0; extra == "app"
 
 # Football Odds Scraper
 

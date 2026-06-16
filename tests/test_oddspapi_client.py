@@ -13,6 +13,7 @@ from football_odds_scraper.oddspapi_client import (
     fetch_fixture_pinnacle_odds,
     fetch_worldcup_fixtures_with_odds,
     fixture_has_started,
+    fixture_is_finished,
     format_fixture_match_label,
     format_fixture_start_time,
     get_world_cup_tournament_id,
@@ -338,6 +339,15 @@ def test_parse_ou_curve_input():
     assert parse_ou_curve_input("invalid") is None
 
 
+def test_parse_ah_curve_input():
+    from football_odds_scraper.oddspapi_client import parse_ah_curve_input
+
+    parsed = parse_ah_curve_input("-0.25:1.83/2.12, -0.5:2.14/1.79, +0.25:1.95/1.95")
+    assert parsed == [(-0.5, 2.14, 1.79), (-0.25, 1.83, 2.12), (0.25, 1.95, 1.95)]
+    assert parse_ah_curve_input("") is None
+    assert parse_ah_curve_input("invalid") is None
+
+
 def test_parse_correct_score_input():
     from football_odds_scraper.oddspapi_client import parse_correct_score_input
 
@@ -382,6 +392,11 @@ def test_format_pinnacle_cs():
     assert extracted["ah_line"] == -0.25
     assert extracted["ah_home"] == 1.92
     assert extracted["ah_away"] == 1.98
+    ah_curve = extracted.get("ah_curve")
+    assert ah_curve is not None
+    assert len(ah_curve) == 2
+    assert ah_curve[0][0] == -0.5
+    assert ah_curve[1][0] == -0.25
 
 
 def test_format_pinnacle_ah():
@@ -448,7 +463,7 @@ def test_extract_pinnacle_odds_finds_totals_by_outcome_id():
     assert extracted["under"] == 1.88
 
 
-def test_extract_team_totals_ignores_non_05_lines():
+def test_extract_team_totals_falls_back_to_higher_lines():
     odds = _sample_bookmaker_odds()
     odds["pinnacle"]["markets"]["1040"] = {
         "bookmakerMarketId": "line/29/1980/team-totals",
@@ -469,10 +484,39 @@ def test_extract_team_totals_ignores_non_05_lines():
     }
     extracted = extract_pinnacle_odds(odds)
     assert extracted is not None
-    assert extracted["tt_home_over"] is None
-    assert extracted["tt_home_under"] is None
+    assert extracted["tt_home_over"] == 1.35
+    assert extracted["tt_home_under"] == 3.20
+    assert extracted["tt_home_line"] == 1.5
     assert extracted["tt_away_over"] == 2.670
     assert extracted["tt_away_under"] == 1.395
+    assert extracted["tt_away_line"] == 0.5
+
+
+def test_extract_team_totals_away_falls_back_to_15():
+    odds = _sample_bookmaker_odds()
+    odds["pinnacle"]["markets"]["1040"] = {
+        "bookmakerMarketId": "line/29/1980/team-totals",
+        "outcomes": {
+            "1041": {
+                "players": {"0": {"price": 1.35, "bookmakerOutcomeId": "home/0.5/over"}},
+            },
+            "1042": {
+                "players": {"0": {"price": 3.20, "bookmakerOutcomeId": "home/0.5/under"}},
+            },
+            "1043": {
+                "players": {"0": {"price": 1.85, "bookmakerOutcomeId": "away/1.5/over"}},
+            },
+            "1044": {
+                "players": {"0": {"price": 2.05, "bookmakerOutcomeId": "away/1.5/under"}},
+            },
+        },
+    }
+    extracted = extract_pinnacle_odds(odds)
+    assert extracted is not None
+    assert extracted["tt_home_line"] == 0.5
+    assert extracted["tt_away_over"] == 1.85
+    assert extracted["tt_away_under"] == 2.05
+    assert extracted["tt_away_line"] == 1.5
 
 
 def test_extract_pinnacle_odds_team_totals_and_ou_curve():
@@ -532,8 +576,10 @@ def test_extract_pinnacle_odds_team_totals_and_ou_curve():
     assert extracted is not None
     assert extracted["tt_home_over"] == 1.35
     assert extracted["tt_home_under"] == 3.20
+    assert extracted["tt_home_line"] == 0.5
     assert extracted["tt_away_over"] == 1.55
     assert extracted["tt_away_under"] == 2.45
+    assert extracted["tt_away_line"] == 0.5
     curve = extracted["ou_curve"]
     assert curve is not None
     assert len(curve) >= 3
@@ -556,13 +602,13 @@ def test_format_pinnacle_calibration():
         "tt_away_under": 2.45,
         "ou_curve": [(1.5, 1.48, 2.73), (2.0, 1.87, 2.04), (2.5, 1.95, 1.90)],
         "correct_score_odds": {(1, 0): 7.5},
-        "ah_line": -0.25,
+        "ah_curve": [(-0.5, 2.05, 1.85), (-0.25, 1.92, 1.98), (0.0, 1.95, 1.95)],
     }
     badge = format_pinnacle_calibration(odds)
     assert "TT" in badge
     assert "O/U×3" in badge
     assert "CS" in badge
-    assert "AH" in badge
+    assert "AH×3" in badge
 
 
 def test_explain_pinnacle_odds_missing_messages():
@@ -740,6 +786,12 @@ def test_fixture_has_started():
 
     now_before = datetime(2026, 6, 15, 20, 0, tzinfo=timezone.utc)
     assert fixture_has_started(fixture, now=now_before) is False
+
+
+def test_fixture_is_finished():
+    assert fixture_is_finished({"statusId": 2}) is True
+    assert fixture_is_finished({"statusId": 1}) is False
+    assert fixture_is_finished({}) is False
 
 
 def test_handle_response_restricted_access():

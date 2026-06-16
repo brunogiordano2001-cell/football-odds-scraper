@@ -11,6 +11,8 @@ football_odds_scraper/backtest.py
 football_odds_scraper/cli.py
 football_odds_scraper/exceptions.py
 football_odds_scraper/models.py
+football_odds_scraper/odds_text_parser.py
+football_odds_scraper/oddspapi_client.py
 football_odds_scraper/onefootball_fixture.py
 football_odds_scraper/parser.py
 football_odds_scraper/pinnacle_client.py
@@ -20,4 +22,5 @@ football_odds_scraper/scraper.py
 football_odds_scraper/selectors.py
 football_odds_scraper/the_odds_api.py
 football_odds_scraper/wc_odds_scraper.py
+football_odds_scraper/world_cup_teams.py
 football_odds_scraper/worldcup_2026.py

@@ -5,7 +5,11 @@ from pathlib import Path
 
 from football_odds_scraper.score_predictor import (
     ScorePredictor,
+    _calibrate_from_both_curves,
     _lambda_from_team_total,
+    _lambda_from_tt,
+    _model_p_ah_home,
+    _poisson_matrix,
     calibrate_from_correct_score,
     calibrate_lambdas,
     find_optimal_rho,
@@ -20,6 +24,14 @@ FIXTURE = Path(__file__).parent / "fixtures" / "sample_football_data.csv"
 def test_lambda_from_team_total():
     lam = _lambda_from_team_total(1.35, 3.20)
     assert 0.5 < lam < 3.0
+
+
+def test_lambda_from_tt_line_15():
+    lam_05 = _lambda_from_tt(1.35, 3.20, 0.5)
+    lam_15 = _lambda_from_tt(1.85, 2.05, 1.5)
+    assert lam_05 is not None
+    assert lam_15 is not None
+    assert lam_15 > lam_05
 
 
 def test_calibrate_lambdas_with_team_totals():
@@ -219,6 +231,47 @@ def test_predict_for_prode_prefers_result_over_1_1():
     assert prode["epv"] >= 2 * prode["p_exact"] + prode["p_result"] - 1e-9
     assert len(prode["top5"]) == 5
     assert prode["top5"][0]["score"] == prode["score_str"]
+    assert len(prode["top3"]) == 3
+    assert len(prode["top3_pure"]) == 3
+    assert prode["top3_coverage"] > 0
+
+
+def test_top3_diverse_includes_second_outcome():
+    """Con draw como 2do resultado (>20%), el top 3 diversificado lo cubre."""
+    pred = ScorePredictor.from_odds(
+        {"home": 1.45, "draw": 4.50, "away": 7.00},
+        {"over": 1.65, "under": 2.25},
+        rho=-0.13,
+    )
+    prode = pred.predict_for_prode()
+    matrix = pred.score_matrix()
+    p_home = float(np.sum(np.tril(matrix, -1)))
+    p_draw = float(np.sum(np.diag(matrix)))
+    p_away = float(np.sum(np.triu(matrix, 1)))
+    second_prob = sorted([p_home, p_draw, p_away], reverse=True)[1]
+
+    top3 = prode["top3"]
+    top3_pure = prode["top3_pure"]
+    assert len(top3) == 3
+    assert top3[0]["score"] == prode["score_str"]
+    assert abs(prode["top3_coverage"] - sum(e["p_exact"] for e in top3)) < 1e-9
+
+    if second_prob > 0.20:
+        pure_outcomes = {e["outcome"] for e in top3_pure}
+        diverse_outcomes = {e["outcome"] for e in top3}
+        if len(pure_outcomes) == 1:
+            assert len(diverse_outcomes) >= 2
+        assert any(e["is_coverage"] for e in top3)
+
+
+def test_prode_edge_vs_base():
+    from football_odds_scraper.score_predictor import BASE_SCORE_RATES, prode_edge_vs_base
+
+    p_model = 0.162
+    base = BASE_SCORE_RATES[(2, 0)]
+    edge = prode_edge_vs_base(2, 0, p_model)
+    assert abs(edge - (p_model / base - 1.0)) < 1e-9
+    assert edge > 1.0  # +178% aprox vs histórico 5.8%
 
 
 def test_prode_epv_formula():
@@ -238,7 +291,29 @@ def test_prode_points_awarded():
     assert prode_points_awarded(2, 0, 0, 1) == 0
 
 
-def test_fit_returns_positive_lambdas():
+def test_sensitivity_analysis_in_predict_for_prode():
+    pred = ScorePredictor.from_odds(
+        {"home": 1.45, "draw": 4.50, "away": 7.00},
+        {"over": 1.65, "under": 2.25},
+        rho=-0.13,
+    )
+    prode = pred.predict_for_prode()
+    sens = prode["sensitivity"]
+
+    assert "k_breaks" in sens
+    assert "score_at_k2" in sens
+    assert "score_at_inf" in sens
+    assert "robustness" in sens
+    assert sens["score_at_k2"] == prode["score"]
+    assert isinstance(sens["robustness"], float)
+    assert sens["robustness_label"] in {"🟢 Robusta", "🟡 Moderada", "🔴 Frágil"}
+
+
+def test_sensitivity_analysis_k2_matches_argmax_at_infinity():
+    pred = ScorePredictor(FAIR_1X2, FAIR_OU)
+    sens = pred.sensitivity_analysis()
+    h, a, _ = pred.most_likely_exact_score()
+    assert sens["score_at_inf"] == (h, a)
     pred = ScorePredictor(FAIR_1X2, FAIR_OU, rho=-0.13, pi=0.05)
     fit = pred.fit()
     assert fit.lambda_home > 0
@@ -322,6 +397,64 @@ def test_fit_with_asian_handicap():
     assert fit.lambda_home >= 0.1
     assert fit.mu_away >= 0.1
     assert fit.lambda_home > fit.mu_away
+
+
+def test_model_p_ah_home_favorite_covers():
+    matrix = _poisson_matrix(1.8, 0.9)
+    p_minus_half = _model_p_ah_home(matrix, -0.5)
+    p_minus_one = _model_p_ah_home(matrix, -1.0)
+    assert 0.0 < p_minus_half < 1.0
+    assert p_minus_half > p_minus_one
+
+
+def test_calibrate_from_both_curves(capsys):
+    lh_ref, la_ref = 1.6, 1.1
+    matrix = _poisson_matrix(lh_ref, la_ref)
+    ou_curve = []
+    for line in (2.0, 2.5, 3.0):
+        lam_total = lh_ref + la_ref
+        from scipy import stats
+
+        p_over = float(stats.poisson.sf(int(line), lam_total))
+        p_under = max(1.0 - p_over, 0.05)
+        ou_curve.append((line, 1.05 / p_over, 1.05 / p_under))
+    ah_curve = []
+    for line in (-0.5, -0.25, 0.25):
+        p_home = _model_p_ah_home(matrix, line)
+        p_away = max(1.0 - p_home, 0.05)
+        ah_curve.append((line, 1.05 / p_home, 1.05 / p_away))
+
+    result = _calibrate_from_both_curves(ou_curve, ah_curve, min_points=3)
+    assert result is not None
+    lh, la = result
+    assert abs(lh - lh_ref) < 0.35
+    assert abs(la - la_ref) < 0.35
+    captured = capsys.readouterr()
+    assert "AH curve: 3 puntos" in captured.out
+    assert "λ_diff desde AH:" in captured.out
+
+
+def test_calibrate_lambdas_with_ah_curve():
+    lh_ref, la_ref = 1.7, 1.0
+    matrix = _poisson_matrix(lh_ref, la_ref)
+    ah_curve = []
+    for line in (-1.0, -0.5, -0.25, 0.0, 0.25):
+        p_home = _model_p_ah_home(matrix, line)
+        p_away = max(1.0 - p_home, 0.05)
+        ah_curve.append((line, 1.05 / p_home, 1.05 / p_away))
+
+    lh, la = calibrate_lambdas(
+        1.55,
+        4.20,
+        5.50,
+        2.15,
+        1.72,
+        ah_curve=ah_curve,
+        goals_line=2.5,
+    )
+    assert lh > la
+    assert 0.1 <= lh <= 4.0
+    assert 0.1 <= la <= 4.0
 
 
 def test_calibration_does_not_default_to_1_1():

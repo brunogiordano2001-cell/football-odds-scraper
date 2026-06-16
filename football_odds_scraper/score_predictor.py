@@ -1,12 +1,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Mapping, Sequence, TypedDict
+from typing import Any, Literal, Mapping, Sequence, TypedDict
 
 import numpy as np
 import pandas as pd
 from scipy import stats
-from scipy.optimize import minimize, minimize_scalar
+from scipy.optimize import brentq, minimize, minimize_scalar
 from football_odds_scraper.probability import fair_probabilities, remove_overround
 
 _EPS = 1e-15
@@ -101,6 +101,151 @@ _OU_LAMBDA_TOTAL_BOUNDS = (0.5, 5.5)
 _LAMBDA_PER_TEAM_MAX = 4.0
 _FOOTBALL_OU_LINE_MIN = 0.5
 _FOOTBALL_OU_LINE_MAX = 5.5
+_FOOTBALL_AH_LINE_MIN = -6.0
+_FOOTBALL_AH_LINE_MAX = 6.0
+
+
+def _filter_ah_curve_football(
+    ah_curve: Sequence[tuple[float, float, float]] | None,
+) -> list[tuple[float, float, float]] | None:
+    if not ah_curve:
+        return None
+    filtered = [
+        (float(line), float(home), float(away))
+        for line, home, away in ah_curve
+        if _FOOTBALL_AH_LINE_MIN <= float(line) <= _FOOTBALL_AH_LINE_MAX
+    ]
+    return filtered if filtered else None
+
+
+def _poisson_matrix(
+    lambda_home: float,
+    lambda_away: float,
+    *,
+    max_goals: int = _CALIB_MAX_GOALS,
+) -> np.ndarray:
+    ph_vec = stats.poisson.pmf(np.arange(max_goals), float(lambda_home))
+    pa_vec = stats.poisson.pmf(np.arange(max_goals), float(lambda_away))
+    return np.outer(ph_vec, pa_vec)
+
+
+def _ah_home_cover_weight(goal_diff: int, line: float) -> float:
+    """Peso de victoria home para handicap asiático (0, 0.5 o 1)."""
+    line_f = round(float(line) * 4) / 4
+    frac = round(abs(line_f) % 1, 2)
+    diff = int(goal_diff)
+
+    if frac in (0.0, 1.0):
+        if diff > -line_f:
+            return 1.0
+        return 0.0
+    if abs(frac - 0.5) < 0.01:
+        if diff > -line_f:
+            return 1.0
+        return 0.0
+    n = int(abs(line_f))
+    if abs(frac - 0.25) < 0.01:
+        if line_f < 0:
+            if diff >= n + 1:
+                return 1.0
+            if diff == n:
+                return 0.5
+            return 0.0
+        if diff >= n + 1:
+            return 1.0
+        if diff == n:
+            return 0.5
+        return 0.0
+    if abs(frac - 0.75) < 0.01:
+        if line_f < 0:
+            if diff >= n + 2:
+                return 1.0
+            if diff == n + 1:
+                return 0.5
+            return 0.0
+        if diff >= n + 2:
+            return 1.0
+        if diff == n + 1:
+            return 0.5
+        return 0.0
+    return 0.0
+
+
+def _model_p_ah_home(matrix: np.ndarray, line: float) -> float:
+    """P implícita de cubrir handicap asiático (lado home) desde matriz Poisson."""
+    line_f = round(float(line) * 4) / 4
+    total = 0.0
+    n = matrix.shape[0]
+    for h in range(n):
+        for a in range(n):
+            prob = matrix[h, a]
+            if prob <= 0.0:
+                continue
+            total += prob * _ah_home_cover_weight(h - a, line_f)
+    return float(np.clip(total, 0.0, 1.0))
+
+
+def _lambda_diff_from_ah_curve(
+    ah_curve: Sequence[tuple[float, float, float]],
+    lambda_total: float,
+    *,
+    min_points: int = 3,
+) -> float | None:
+    """λ_diff = λ_home − λ_away que minimiza MSE contra curva AH."""
+    points = sorted(
+        [(float(line), float(home), float(away)) for line, home, away in ah_curve],
+        key=lambda item: item[0],
+    )
+    if len(points) < min_points:
+        return None
+
+    total = max(float(lambda_total), 0.2)
+    lo, hi = -total + 0.2, total - 0.2
+
+    def mse(lambda_diff: float) -> float:
+        lh = (total + lambda_diff) / 2.0
+        la = (total - lambda_diff) / 2.0
+        lh, la = max(0.1, lh), max(0.1, la)
+        matrix = _poisson_matrix(lh, la)
+        err = 0.0
+        for line, home_price, away_price in points:
+            p_home_mkt, _ = _devig_2way(home_price, away_price)
+            p_home_model = _model_p_ah_home(matrix, line)
+            err += (p_home_model - p_home_mkt) ** 2
+        return err
+
+    result = minimize_scalar(mse, bounds=(lo, hi), method="bounded")
+    return float(result.x)
+
+
+def _calibrate_from_both_curves(
+    ou_curve: Sequence[tuple[float, float, float]],
+    ah_curve: Sequence[tuple[float, float, float]],
+    *,
+    min_points: int = 3,
+) -> tuple[float, float] | None:
+    """λ_total desde O/U + λ_diff desde AH → λ_home, λ_away."""
+    lambda_total = _lambda_total_from_ou_curve(ou_curve, min_points=min_points)
+    if lambda_total is None:
+        return None
+    lambda_diff = _lambda_diff_from_ah_curve(
+        ah_curve,
+        lambda_total,
+        min_points=min_points,
+    )
+    if lambda_diff is None:
+        return None
+
+    lh = (lambda_total + lambda_diff) / 2.0
+    la = (lambda_total - lambda_diff) / 2.0
+    print("=== CALIBRACIÓN ===")
+    print(f"  Modo: curva O/U + curva AH")
+    print(f"  O/U curve: {len(list(ou_curve))} puntos")
+    print(f"  AH curve: {len(list(ah_curve))} puntos")
+    print(f"  λ_diff desde AH: {lambda_diff:.3f}")
+    print(f"  λ_total desde O/U: {lambda_total:.3f}")
+    print(f"  → λ_home={lh:.3f} λ_away={la:.3f}")
+    return max(0.1, lh), max(0.1, la)
 
 
 def _filter_ou_curve_football(
@@ -210,14 +355,18 @@ def _calibrate_from_team_totals(
     tt_home_under: float | None,
     tt_away_over: float | None,
     tt_away_under: float | None,
+    tt_home_line: float | None,
+    tt_away_line: float | None,
     ou_curve_filtered: list[tuple[float, float, float]] | None,
     goals_line: float,
     p_over: float,
     p_over_price: float,
 ) -> tuple[float, float]:
-    """Calibración TT 0.5 (completa o parcial) + curva O/U."""
+    """Calibración TT (0.5/1.5/2.5) completa o parcial + curva O/U."""
     has_home_tt = _has_tt_side(tt_home_over, tt_home_under)
     has_away_tt = _has_tt_side(tt_away_over, tt_away_under)
+    home_line = float(tt_home_line) if tt_home_line is not None else 0.5
+    away_line = float(tt_away_line) if tt_away_line is not None else 0.5
 
     lambda_total_opt = (
         _lambda_total_from_ou_curve(ou_curve_filtered, min_points=1)
@@ -230,26 +379,37 @@ def _calibrate_from_team_totals(
     lh0: float | None = None
     la0: float | None = None
     if has_home_tt:
-        lh0 = _lambda_from_team_total(float(tt_home_over), float(tt_home_under))  # type: ignore[arg-type]
+        lh0 = _lambda_from_tt(
+            float(tt_home_over), float(tt_home_under), home_line  # type: ignore[arg-type]
+        )
+        if lh0 is None:
+            has_home_tt = False
     if has_away_tt:
-        la0 = _lambda_from_team_total(float(tt_away_over), float(tt_away_under))  # type: ignore[arg-type]
+        la0 = _lambda_from_tt(
+            float(tt_away_over), float(tt_away_under), away_line  # type: ignore[arg-type]
+        )
+        if la0 is None:
+            has_away_tt = False
 
     if has_home_tt and has_away_tt:
         assert lh0 is not None and la0 is not None
         lh, la = _refine_lambdas_with_ou_curve(lh0, la0, ou_curve_filtered or [])
-        mode = "ambos TT 0.5"
+        mode = f"ambos TT (home {home_line:g} / away {away_line:g})"
     elif has_away_tt and not has_home_tt:
         assert la0 is not None
         la = la0
         lh = max(0.1, lambda_total_opt - la0)
-        mode = "solo away TT 0.5 → λ_home = λ_total − λ_away"
+        mode = f"solo away TT {away_line:g} → λ_home = λ_total − λ_away"
     elif has_home_tt and not has_away_tt:
         assert lh0 is not None
         lh = lh0
         la = max(0.1, lambda_total_opt - lh0)
-        mode = "solo home TT 0.5 → λ_away = λ_total − λ_home"
+        mode = f"solo home TT {home_line:g} → λ_away = λ_total − λ_home"
     else:
         raise ValueError("team totals no disponibles")
+
+    print(f"  tt_home_line={tt_home_line} → λ_home={lh:.3f}")
+    print(f"  tt_away_line={tt_away_line} → λ_away={la:.3f}")
 
     if ou_curve_filtered and len(ou_curve_filtered) >= 3:
         curve_preview = [
@@ -275,11 +435,35 @@ def _calibrate_from_team_totals(
     return lh, la
 
 
+def _lambda_from_tt(
+    over_odd: float,
+    under_odd: float,
+    line: float,
+) -> float | None:
+    """λ de Poisson desde team total de cualquier línea (.5, 1.5, 2.5, ...)."""
+    p_over, _ = _devig_2way(float(over_odd), float(under_odd))
+    line_f = float(line)
+
+    if line_f == 0.5:
+        p_under = 1.0 - p_over
+        return max(0.05, -float(np.log(max(p_under, 0.001))))
+
+    floor_line = int(line_f)
+
+    def equation(lam: float) -> float:
+        return float(stats.poisson.sf(floor_line, lam)) - p_over
+
+    try:
+        lam = brentq(equation, 0.01, 15.0)
+        return max(0.05, float(lam))
+    except (ValueError, RuntimeError):
+        return None
+
+
 def _lambda_from_team_total(over_odd: float, under_odd: float) -> float:
-    """λ desde team total 0.5: P(0 goles) = e^{-λ} = prob implícita del under."""
-    _, p_under = _devig_2way(float(over_odd), float(under_odd))
-    p_zero = float(np.clip(p_under, _EPS, 1.0 - _EPS))
-    return max(0.05, -float(np.log(p_zero)))
+    """Compat: TT 0.5."""
+    result = _lambda_from_tt(over_odd, under_odd, 0.5)
+    return result if result is not None else 0.05
 
 
 def _calibrate_lambdas_joint_fallback(
@@ -291,15 +475,14 @@ def _calibrate_lambdas_joint_fallback(
     ah_line: float | None,
     ah_home: float | None,
     ah_away: float | None,
+    ah_curve: list[tuple[float, float, float]] | None,
     goals_line: float,
 ) -> tuple[float, float]:
-    """Calibración conjunta 1X2 + O/U (+ AH) vía Nelder-Mead."""
+    """Calibración conjunta 1X2 + O/U (+ AH curva) vía Nelder-Mead."""
     max_goals = _CALIB_MAX_GOALS
 
     def poisson_matrix(lh: float, la: float) -> np.ndarray:
-        ph_vec = stats.poisson.pmf(np.arange(max_goals), lh)
-        pa_vec = stats.poisson.pmf(np.arange(max_goals), la)
-        return np.outer(ph_vec, pa_vec)
+        return _poisson_matrix(lh, la, max_goals=max_goals)
 
     def model_probs(lh: float, la: float) -> tuple[float, float, float, float]:
         matrix = poisson_matrix(lh, la)
@@ -324,12 +507,16 @@ def _calibrate_lambdas_joint_fallback(
             + 2.0 * (ma - pa) ** 2
             + 3.0 * (mo - po) ** 2
         )
-        if ah_line is not None and ah_home is not None and ah_away is not None:
+        matrix = poisson_matrix(lh, la)
+        if ah_curve:
+            for line, home_price, away_price in ah_curve:
+                p_home_mkt, _ = _devig_2way(float(home_price), float(away_price))
+                p_home_model = _model_p_ah_home(matrix, line)
+                err += 2.0 * (p_home_model - p_home_mkt) ** 2
+        elif ah_line is not None and ah_home is not None and ah_away is not None:
             p_ah_home, _ = _devig_2way(float(ah_home), float(ah_away))
-            expected_diff = lh - la
-            model_ah = 0.5 + (expected_diff + float(ah_line)) * 0.15
-            model_ah = float(np.clip(model_ah, 0.05, 0.95))
-            err += 2.0 * (model_ah - p_ah_home) ** 2
+            p_home_model = _model_p_ah_home(matrix, float(ah_line))
+            err += 2.0 * (p_home_model - p_ah_home) ** 2
         return err
 
     total_goals_est = goals_line if po > 0.5 else max(0.5, goals_line - 0.5)
@@ -361,11 +548,21 @@ def calibrate_lambdas(
     tt_home_under: float | None = None,
     tt_away_over: float | None = None,
     tt_away_under: float | None = None,
+    tt_home_line: float | None = None,
+    tt_away_line: float | None = None,
     ou_curve: Sequence[tuple[float, float, float]] | None = None,
+    ah_curve: Sequence[tuple[float, float, float]] | None = None,
     goals_line: float = 2.5,
     input_is_odds: bool = True,
 ) -> tuple[float, float]:
-    """Estima λ_home y λ_away desde team totals + curva O/U, o fallback conjunto."""
+    """Estima λ_home y λ_away desde curvas O/U+AH, team totals, o fallback conjunto."""
+    print(f"=== CALIBRACIÓN DEBUG ===")
+    print(f"  tt_home_over={tt_home_over} tt_home_under={tt_home_under}")
+    print(f"  tt_away_over={tt_away_over} tt_away_under={tt_away_under}")
+    print(f"  tt_home_line={tt_home_line} tt_away_line={tt_away_line}")
+    print(f"  ou_curve={ou_curve[:3] if ou_curve else None}")
+    print(f"  ah_line={ah_line}")
+
     if input_is_odds:
         ph, pd, pa = _devig_3way(p_home, p_draw, p_away)
         po, _ = _devig_2way(p_over, p_under)
@@ -375,6 +572,7 @@ def calibrate_lambdas(
     has_home_tt = _has_tt_side(tt_home_over, tt_home_under)
     has_away_tt = _has_tt_side(tt_away_over, tt_away_under)
     ou_curve_filtered = _filter_ou_curve_football(ou_curve)
+    ah_curve_filtered = _filter_ah_curve_football(ah_curve)
     p_over_price = float(p_over) if input_is_odds else float(p_over)
 
     if has_home_tt or has_away_tt:
@@ -383,12 +581,34 @@ def calibrate_lambdas(
             tt_home_under=tt_home_under,
             tt_away_over=tt_away_over,
             tt_away_under=tt_away_under,
+            tt_home_line=tt_home_line,
+            tt_away_line=tt_away_line,
             ou_curve_filtered=ou_curve_filtered,
             goals_line=goals_line,
             p_over=po,
             p_over_price=p_over_price,
         )
-        return _clamp_lambdas_realistic(lh, la)
+        lh, la = _clamp_lambdas_realistic(lh, la)
+        print(f"  λ_home={lh:.3f} λ_away={la:.3f} total={lh + la:.3f}")
+        print(f"=== FIN CALIBRACIÓN ===")
+        return lh, la
+
+    if (
+        ou_curve_filtered
+        and len(ou_curve_filtered) >= 3
+        and ah_curve_filtered
+        and len(ah_curve_filtered) >= 3
+    ):
+        both = _calibrate_from_both_curves(
+            ou_curve_filtered,
+            ah_curve_filtered,
+            min_points=3,
+        )
+        if both is not None:
+            lh, la = _clamp_lambdas_realistic(*both)
+            print(f"  λ_home={lh:.3f} λ_away={la:.3f} total={lh + la:.3f}")
+            print(f"=== FIN CALIBRACIÓN ===")
+            return lh, la
 
     lh, la = _calibrate_lambdas_joint_fallback(
         ph,
@@ -398,9 +618,13 @@ def calibrate_lambdas(
         ah_line=ah_line,
         ah_home=ah_home,
         ah_away=ah_away,
+        ah_curve=ah_curve_filtered,
         goals_line=goals_line,
     )
-    return _clamp_lambdas_realistic(lh, la)
+    lh, la = _clamp_lambdas_realistic(lh, la)
+    print(f"  λ_home={lh:.3f} λ_away={la:.3f} total={lh + la:.3f}")
+    print(f"=== FIN CALIBRACIÓN ===")
+    return lh, la
 
 
 def calibrate_from_correct_score(
@@ -472,6 +696,9 @@ class ProdeTopScore(TypedDict):
     epv: float
     p_exact: float
     p_result: float
+    edge_vs_base: float
+    outcome: Literal["H", "D", "A"]
+    is_coverage: bool
 
 
 class ProdePrediction(TypedDict):
@@ -482,6 +709,94 @@ class ProdePrediction(TypedDict):
     p_result: float
     epv_matrix: np.ndarray
     top5: list[ProdeTopScore]
+    top3: list[ProdeTopScore]
+    top3_pure: list[ProdeTopScore]
+    top3_coverage: float
+    sensitivity: dict[str, Any]
+
+
+def _format_score_tuple(score: tuple[int, int] | None) -> str:
+    if score is None:
+        return "0-0"
+    return f"{score[0]}-{score[1]}"
+
+
+def sensitivity_from_matrix(
+    matrix: np.ndarray,
+    *,
+    k_range: tuple[float, float] = (1.0, 100.0),
+    steps: int = 200,
+    k_infinity: float = 1000.0,
+) -> dict[str, Any]:
+    """
+    Evalúa EPV(k) = k × P(exact) + P(resultado) para k en k_range.
+
+    Versión standalone (sin ScorePredictor) para UI/caché.
+    """
+    n = matrix.shape[0]
+    p_home, p_draw, p_away = _prode_outcome_probs(matrix)
+
+    def result_prob(h: int, a: int) -> float:
+        if h > a:
+            return p_home
+        if h == a:
+            return p_draw
+        return p_away
+
+    def best_score_at_k(k: float) -> tuple[int, int]:
+        best: tuple[int, int] = (0, 0)
+        best_val = -1.0
+        for h in range(n):
+            for a in range(n):
+                val = float(k) * float(matrix[h, a]) + result_prob(h, a)
+                if val > best_val:
+                    best_val = val
+                    best = (h, a)
+        return best
+
+    k_values = np.linspace(k_range[0], k_range[1], steps)
+    prev_score = best_score_at_k(float(k_values[0]))
+    k_breaks: list[dict[str, Any]] = []
+
+    for k in k_values[1:]:
+        curr = best_score_at_k(float(k))
+        if curr != prev_score:
+            k_breaks.append(
+                {
+                    "k": round(float(k), 1),
+                    "from": prev_score,
+                    "to": curr,
+                }
+            )
+            prev_score = curr
+
+    score_at_k2 = best_score_at_k(2.0)
+    score_at_inf = best_score_at_k(k_infinity)
+    breaks_after_k2 = [b for b in k_breaks if float(b["k"]) > 2.0]
+    robustness = float(breaks_after_k2[0]["k"]) if breaks_after_k2 else 100.0
+
+    if robustness >= 20:
+        robustness_label = "🟢 Robusta"
+        robustness_desc = f"El score no cambia hasta k={robustness:.0f}"
+    elif robustness >= 5:
+        robustness_label = "🟡 Moderada"
+        to_score = _format_score_tuple(breaks_after_k2[0]["to"])
+        robustness_desc = f"Cambia a {to_score} con k={robustness:.0f}"
+    else:
+        robustness_label = "🔴 Frágil"
+        to_score = _format_score_tuple(breaks_after_k2[0]["to"])
+        robustness_desc = f"Cambia a {to_score} con k={robustness:.0f}"
+
+    return {
+        "k_breaks": k_breaks,
+        "score_at_inf": score_at_inf,
+        "score_at_k2": score_at_k2,
+        "robustness": robustness,
+        "robustness_label": robustness_label,
+        "robustness_desc": robustness_desc,
+        "coincide_with_argmax": score_at_k2 == score_at_inf,
+        "first_break_after_k2": breaks_after_k2[0] if breaks_after_k2 else None,
+    }
 
 
 def prode_result_prob(matrix: np.ndarray, home_goals: int, away_goals: int) -> float:
@@ -500,6 +815,165 @@ def prode_epv(matrix: np.ndarray, home_goals: int, away_goals: int) -> float:
     """EPV = 3·P(exact) + 1·P(solo resultado) = 2·P(exact) + P(resultado)."""
     p_exact = float(matrix[home_goals, away_goals])
     return 2.0 * p_exact + prode_result_prob(matrix, home_goals, away_goals)
+
+
+_PRODE_DIVERSITY_THRESHOLD = 0.20
+_PRODE_DEFAULT_BASE_RATE = 0.01
+
+
+def prode_score_outcome(home_goals: int, away_goals: int) -> Literal["H", "D", "A"]:
+    if home_goals > away_goals:
+        return "H"
+    if home_goals == away_goals:
+        return "D"
+    return "A"
+
+
+def prode_edge_vs_base(home_goals: int, away_goals: int, p_exact: float) -> float:
+    """Edge relativo vs frecuencia histórica: (P_modelo / BASE_RATE) - 1."""
+    base = BASE_SCORE_RATES.get((home_goals, away_goals), _PRODE_DEFAULT_BASE_RATE)
+    if base <= 0:
+        return 0.0
+    return float(p_exact) / base - 1.0
+
+
+def _prode_outcome_probs(matrix: np.ndarray) -> tuple[float, float, float]:
+    p_home = float(np.sum(np.tril(matrix, -1)))
+    p_draw = float(np.sum(np.diag(matrix)))
+    p_away = float(np.sum(np.triu(matrix, 1)))
+    return p_home, p_draw, p_away
+
+
+def _make_prode_top_score(
+    matrix: np.ndarray,
+    epv_matrix: np.ndarray,
+    home_goals: int,
+    away_goals: int,
+    *,
+    p_home: float,
+    p_draw: float,
+    p_away: float,
+    is_coverage: bool = False,
+) -> ProdeTopScore:
+    p_exact = float(matrix[home_goals, away_goals])
+    outcome = prode_score_outcome(home_goals, away_goals)
+    if outcome == "H":
+        p_result = p_home
+    elif outcome == "D":
+        p_result = p_draw
+    else:
+        p_result = p_away
+    return {
+        "score": f"{home_goals}-{away_goals}",
+        "home_goals": home_goals,
+        "away_goals": away_goals,
+        "epv": float(epv_matrix[home_goals, away_goals]),
+        "p_exact": p_exact,
+        "p_result": p_result,
+        "edge_vs_base": prode_edge_vs_base(home_goals, away_goals, p_exact),
+        "outcome": outcome,
+        "is_coverage": is_coverage,
+    }
+
+
+def _rank_scores_by_epv(
+    matrix: np.ndarray,
+    epv_matrix: np.ndarray,
+) -> list[tuple[int, int, float]]:
+    ranked: list[tuple[int, int, float]] = []
+    n = matrix.shape[0]
+    for h in range(n):
+        for a in range(n):
+            ranked.append((h, a, float(epv_matrix[h, a])))
+    ranked.sort(key=lambda item: -item[2])
+    return ranked
+
+
+def top3_prode_pure(
+    matrix: np.ndarray,
+    epv_matrix: np.ndarray,
+) -> list[ProdeTopScore]:
+    """Top 3 scores por EPV puro (sin diversidad de resultado)."""
+    p_home, p_draw, p_away = _prode_outcome_probs(matrix)
+    ranked = _rank_scores_by_epv(matrix, epv_matrix)
+    return [
+        _make_prode_top_score(
+            matrix,
+            epv_matrix,
+            h,
+            a,
+            p_home=p_home,
+            p_draw=p_draw,
+            p_away=p_away,
+        )
+        for h, a, _ in ranked[:3]
+    ]
+
+
+def top3_prode_diverse(
+    matrix: np.ndarray,
+    epv_matrix: np.ndarray,
+    *,
+    diversity_threshold: float = _PRODE_DIVERSITY_THRESHOLD,
+) -> list[ProdeTopScore]:
+    """
+    Top 3 EPV con diversidad de resultado 1X2.
+
+    #1 siempre es el mayor EPV absoluto. Si el 2do resultado por P(1X2)
+    supera ``diversity_threshold``, se fuerza al menos un score de ese resultado.
+    """
+    p_home, p_draw, p_away = _prode_outcome_probs(matrix)
+    ranked = _rank_scores_by_epv(matrix, epv_matrix)
+    if not ranked:
+        return []
+
+    outcomes_by_prob = sorted(
+        [("H", p_home), ("D", p_draw), ("A", p_away)],
+        key=lambda item: -item[1],
+    )
+    second_outcome, second_prob = outcomes_by_prob[1]
+
+    picks: list[tuple[int, int]] = []
+    coverage_coords: set[tuple[int, int]] = set()
+
+    h0, a0, _ = ranked[0]
+    picks.append((h0, a0))
+
+    need_diversity = second_prob > diversity_threshold
+    if need_diversity and prode_score_outcome(h0, a0) != second_outcome:
+        for h, a, _ in ranked:
+            if prode_score_outcome(h, a) == second_outcome:
+                if (h, a) not in picks:
+                    picks.append((h, a))
+                    coverage_coords.add((h, a))
+                break
+
+    for h, a, _ in ranked:
+        if len(picks) >= 3:
+            break
+        if (h, a) not in picks:
+            picks.append((h, a))
+
+    entries = [
+        _make_prode_top_score(
+            matrix,
+            epv_matrix,
+            h,
+            a,
+            p_home=p_home,
+            p_draw=p_draw,
+            p_away=p_away,
+            is_coverage=(h, a) in coverage_coords,
+        )
+        for h, a in picks[:3]
+    ]
+    entries.sort(key=lambda item: -item["epv"])
+    return entries
+
+
+def prode_top3_coverage(top3: Sequence[ProdeTopScore]) -> float:
+    """Suma de P(exact) de los 3 scores seleccionados."""
+    return sum(float(entry["p_exact"]) for entry in top3)
 
 
 def prode_points_awarded(
@@ -588,7 +1062,10 @@ class ScorePredictor:
         tt_home_under: float | None = None,
         tt_away_over: float | None = None,
         tt_away_under: float | None = None,
+        tt_home_line: float | None = None,
+        tt_away_line: float | None = None,
         ou_curve: Sequence[tuple[float, float, float]] | None = None,
+        ah_curve: Sequence[tuple[float, float, float]] | None = None,
         global_params: GlobalModelParams | None = None,
         # Deprecado: se ignora si hay global_params o entrenamiento previo
         fit_rho: bool | None = None,
@@ -622,9 +1099,16 @@ class ScorePredictor:
         self.tt_home_under = float(tt_home_under) if tt_home_under is not None else None
         self.tt_away_over = float(tt_away_over) if tt_away_over is not None else None
         self.tt_away_under = float(tt_away_under) if tt_away_under is not None else None
+        self.tt_home_line = float(tt_home_line) if tt_home_line is not None else None
+        self.tt_away_line = float(tt_away_line) if tt_away_line is not None else None
         self.ou_curve: list[tuple[float, float, float]] | None = (
             [(float(p), float(o), float(u)) for p, o, u in ou_curve]
             if ou_curve
+            else None
+        )
+        self.ah_curve: list[tuple[float, float, float]] | None = (
+            [(float(line), float(home), float(away)) for line, home, away in ah_curve]
+            if ah_curve
             else None
         )
 
@@ -933,7 +1417,7 @@ class ScorePredictor:
             and self.ah_home > 0
             and self.ah_away is not None
             and self.ah_away > 0
-        )
+        ) or bool(self.ah_curve and len(self.ah_curve) >= 3)
         calibrated_with_ah = use_ah
         ah_line_used: float | None = self.ah_line if use_ah else None
         use_cs = bool(self.correct_score_odds)
@@ -970,7 +1454,10 @@ class ScorePredictor:
                 tt_home_under=self.tt_home_under,
                 tt_away_over=self.tt_away_over,
                 tt_away_under=self.tt_away_under,
+                tt_home_line=self.tt_home_line,
+                tt_away_line=self.tt_away_line,
                 ou_curve=self.ou_curve,
+                ah_curve=self.ah_curve,
                 goals_line=self.goals_line,
                 input_is_odds=False,
             )
@@ -1206,13 +1693,26 @@ class ScorePredictor:
         """Score con mayor ratio model_prob / base_rate histórico."""
         return self.most_likely_exact_score(method="value_ratio", rho=rho)
 
+    def sensitivity_analysis(
+        self,
+        *,
+        k_range: tuple[float, float] = (1.0, 100.0),
+        steps: int = 200,
+        k_infinity: float = 1000.0,
+    ) -> dict[str, Any]:
+        """Evalúa EPV(k) = k × P(exact) + P(resultado) para k en k_range."""
+        return sensitivity_from_matrix(
+            self.score_matrix(),
+            k_range=k_range,
+            steps=steps,
+            k_infinity=k_infinity,
+        )
+
     def predict_for_prode(self) -> ProdePrediction:
         """Score con mayor EPV (Expected Prode Value): 2·P(exact) + P(resultado 1X2)."""
         matrix = self.score_matrix()
         n = matrix.shape[0]
-        p_home = float(np.sum(np.tril(matrix, -1)))
-        p_draw = float(np.sum(np.diag(matrix)))
-        p_away = float(np.sum(np.triu(matrix, 1)))
+        p_home, p_draw, p_away = _prode_outcome_probs(matrix)
 
         def result_prob(h: int, a: int) -> float:
             if h > a:
@@ -1237,24 +1737,30 @@ class ScorePredictor:
             best_score = (0, 0)
             best_epv = float(epv_matrix[0, 0])
 
-        ranked: list[tuple[tuple[int, int], float]] = []
-        for h in range(n):
-            for a in range(n):
-                ranked.append(((h, a), float(epv_matrix[h, a])))
-        ranked.sort(key=lambda item: -item[1])
+        ranked = _rank_scores_by_epv(matrix, epv_matrix)
 
         top5: list[ProdeTopScore] = []
-        for (h, a), epv in ranked[:5]:
+        for h, a, _ in ranked[:5]:
             top5.append(
-                {
-                    "score": f"{h}-{a}",
-                    "home_goals": h,
-                    "away_goals": a,
-                    "epv": epv,
-                    "p_exact": float(matrix[h, a]),
-                    "p_result": result_prob(h, a),
-                }
+                _make_prode_top_score(
+                    matrix,
+                    epv_matrix,
+                    h,
+                    a,
+                    p_home=p_home,
+                    p_draw=p_draw,
+                    p_away=p_away,
+                )
             )
+
+        top3_pure = top3_prode_pure(matrix, epv_matrix)
+        top3 = top3_prode_diverse(matrix, epv_matrix)
+        if not top3_pure:
+            top3_pure = top5[:3]
+        if not top3:
+            top3 = top3_pure
+        top3_coverage = prode_top3_coverage(top3) if top3 else 0.0
+        sensitivity = self.sensitivity_analysis()
 
         bh, ba = best_score
         return {
@@ -1265,6 +1771,10 @@ class ScorePredictor:
             "p_result": result_prob(bh, ba),
             "epv_matrix": epv_matrix,
             "top5": top5,
+            "top3": top3,
+            "top3_pure": top3_pure,
+            "top3_coverage": top3_coverage,
+            "sensitivity": sensitivity,
         }
 
     @property

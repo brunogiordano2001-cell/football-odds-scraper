@@ -22,6 +22,9 @@ from football_odds_scraper.backtest import (
 from football_odds_scraper.score_predictor import (
     _DEFAULT_RHO,
     ScorePredictor,
+    _model_p_ah_home,
+    _poisson_matrix,
+    _poisson_total_over_prob,
     calibrate_lambdas,
     find_optimal_rho,
     prode_points_awarded,
@@ -84,6 +87,10 @@ class ModeMetrics:
 class ProdeMetrics(ModeMetrics):
     epv_sum: float = 0.0
     total_points: int = 0
+    lambda_home_sum: float = 0.0
+    lambda_away_sum: float = 0.0
+    lambda_home_sq_sum: float = 0.0
+    lambda_away_sq_sum: float = 0.0
 
     @property
     def avg_epv(self) -> float:
@@ -92,6 +99,48 @@ class ProdeMetrics(ModeMetrics):
     @property
     def avg_points(self) -> float:
         return self.total_points / self.n_matches if self.n_matches else 0.0
+
+    @property
+    def lambda_home_mean(self) -> float:
+        return self.lambda_home_sum / self.n_matches if self.n_matches else 0.0
+
+    @property
+    def lambda_away_mean(self) -> float:
+        return self.lambda_away_sum / self.n_matches if self.n_matches else 0.0
+
+    @property
+    def lambda_home_std(self) -> float:
+        if self.n_matches < 2:
+            return 0.0
+        mean = self.lambda_home_mean
+        var = self.lambda_home_sq_sum / self.n_matches - mean * mean
+        return float(np.sqrt(max(var, 0.0)))
+
+    @property
+    def lambda_away_std(self) -> float:
+        if self.n_matches < 2:
+            return 0.0
+        mean = self.lambda_away_mean
+        var = self.lambda_away_sq_sum / self.n_matches - mean * mean
+        return float(np.sqrt(max(var, 0.0)))
+
+
+@dataclass
+class Top3CoverageMetrics:
+    """Modo H: top 3 EPV puro vs top 3 con diversidad de resultado."""
+
+    label: str
+    n_matches: int = 0
+    top3_pure_hits: int = 0
+    top3_diverse_hits: int = 0
+
+    @property
+    def top3_pure_acc(self) -> float:
+        return self.top3_pure_hits / self.n_matches if self.n_matches else 0.0
+
+    @property
+    def top3_diverse_acc(self) -> float:
+        return self.top3_diverse_hits / self.n_matches if self.n_matches else 0.0
 
 
 def _url_to_filename(url: str) -> str:
@@ -139,6 +188,44 @@ def train_test_split(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
     shuffled = df.sample(frac=1.0, random_state=RANDOM_SEED).reset_index(drop=True)
     split = int(len(shuffled) * TRAIN_FRACTION)
     return shuffled.iloc[:split].copy(), shuffled.iloc[split:].copy()
+
+
+def _fair_to_odds(prob: float, overround: float = 1.05) -> float:
+    return overround / max(float(prob), 1e-6)
+
+
+_SYNTHETIC_OU_LINES = [1.5, 2.0, 2.5, 3.0, 3.5]
+_SYNTHETIC_AH_LINES = [-1.5, -1.0, -0.75, -0.5, -0.25, 0.25, 0.5, 0.75, 1.0, 1.5]
+
+
+def _synthetic_ou_curve(
+    lambda_home: float,
+    lambda_away: float,
+    *,
+    overround: float = 1.05,
+) -> list[tuple[float, float, float]]:
+    lambda_total = float(lambda_home) + float(lambda_away)
+    curve: list[tuple[float, float, float]] = []
+    for line in _SYNTHETIC_OU_LINES:
+        p_over = _poisson_total_over_prob(lambda_total, line)
+        p_under = max(1.0 - p_over, 1e-6)
+        curve.append((line, overround / p_over, overround / p_under))
+    return curve
+
+
+def _synthetic_ah_curve(
+    lambda_home: float,
+    lambda_away: float,
+    *,
+    overround: float = 1.05,
+) -> list[tuple[float, float, float]]:
+    matrix = _poisson_matrix(float(lambda_home), float(lambda_away))
+    curve: list[tuple[float, float, float]] = []
+    for line in _SYNTHETIC_AH_LINES:
+        p_home = _model_p_ah_home(matrix, line)
+        p_away = max(1.0 - p_home, 1e-6)
+        curve.append((line, overround / p_home, overround / p_away))
+    return curve
 
 
 def _synthetic_cs_odds(
@@ -325,6 +412,12 @@ def evaluate_mode_prode(
                 goals_line=GOALS_LINE,
             )
             predictor.fit()
+            fit = predictor._fit
+            if fit is not None:
+                metrics.lambda_home_sum += fit.lambda_home
+                metrics.lambda_away_sum += fit.mu_away
+                metrics.lambda_home_sq_sum += fit.lambda_home ** 2
+                metrics.lambda_away_sq_sum += fit.mu_away ** 2
             matrix = predictor.score_matrix()
             if method == "prode":
                 prode = predictor.predict_for_prode()
@@ -360,6 +453,159 @@ def evaluate_mode_prode(
             metrics.pred_1_1 += 1
 
     return metrics
+
+
+def evaluate_mode_j(
+    df: pd.DataFrame,
+    *,
+    rho: float = _DEFAULT_RHO,
+) -> ProdeMetrics:
+    """Modo J: prode EPV con curva AH sintética desde λ de mercado."""
+    metrics = ProdeMetrics(label="J: prode EPV + curva AH")
+
+    for _, row in df.iterrows():
+        fthg = int(row["FTHG"])
+        ftag = int(row["FTAG"])
+        odds_1x2 = {
+            k: float(row[PINNACLE_ODDS_COLS[k]])
+            for k in ("home", "draw", "away")
+        }
+        odds_ou = {
+            k: float(row[PINNACLE_ODDS_COLS[k]])
+            for k in ("over", "under")
+        }
+        try:
+            ref_lh, ref_la = calibrate_lambdas(
+                odds_1x2["home"],
+                odds_1x2["draw"],
+                odds_1x2["away"],
+                odds_ou["over"],
+                odds_ou["under"],
+                input_is_odds=True,
+                goals_line=GOALS_LINE,
+            )
+            ou_curve = _synthetic_ou_curve(ref_lh, ref_la)
+            ah_curve = _synthetic_ah_curve(ref_lh, ref_la)
+            predictor = ScorePredictor.from_odds(
+                odds_1x2,
+                odds_ou,
+                rho=rho,
+                max_goals=MAX_GOALS,
+                goals_line=GOALS_LINE,
+                ou_curve=ou_curve,
+                ah_curve=ah_curve,
+            )
+            predictor.fit()
+            fit = predictor._fit
+            if fit is not None:
+                metrics.lambda_home_sum += fit.lambda_home
+                metrics.lambda_away_sum += fit.mu_away
+                metrics.lambda_home_sq_sum += fit.lambda_home ** 2
+                metrics.lambda_away_sq_sum += fit.mu_away ** 2
+            prode = predictor.predict_for_prode()
+            pred_h, pred_a = prode["score"]
+            epv = float(prode["epv"])
+            pred_outcome = predicted_outcome_from_matrix(predictor)
+            top3 = predictor.top_exact_scores(3)
+            actual_score = f"{fthg}-{ftag}"
+            top3_hit = any(
+                f"{int(r['home_goals'])}-{int(r['away_goals'])}" == actual_score
+                for _, r in top3.iterrows()
+            )
+        except (ValueError, KeyError):
+            continue
+
+        actual_outcome = outcome_from_goals(fthg, ftag)
+        metrics.n_matches += 1
+        metrics.epv_sum += epv
+        metrics.total_points += prode_points_awarded(pred_h, pred_a, fthg, ftag)
+        if pred_h == fthg and pred_a == ftag:
+            metrics.exact_hits += 1
+        if pred_outcome == actual_outcome:
+            metrics.result_hits += 1
+        if top3_hit:
+            metrics.top3_hits += 1
+        if pred_h == 1 and pred_a == 1:
+            metrics.pred_1_1 += 1
+
+    return metrics
+
+
+def _top3_hit(
+    top3: list[dict[str, object]],
+    actual_home: int,
+    actual_away: int,
+) -> bool:
+    actual_score = f"{actual_home}-{actual_away}"
+    return any(str(entry["score"]) == actual_score for entry in top3)
+
+
+def evaluate_mode_h(
+    df: pd.DataFrame,
+    *,
+    rho: float = _DEFAULT_RHO,
+) -> Top3CoverageMetrics:
+    """Modo H: compara acierto en top 3 EPV puro vs top 3 con diversidad."""
+    metrics = Top3CoverageMetrics(label="H: top 3 diversificado vs puro EPV")
+
+    for _, row in df.iterrows():
+        fthg = int(row["FTHG"])
+        ftag = int(row["FTAG"])
+        odds_1x2 = {
+            k: float(row[PINNACLE_ODDS_COLS[k]])
+            for k in ("home", "draw", "away")
+        }
+        odds_ou = {
+            k: float(row[PINNACLE_ODDS_COLS[k]])
+            for k in ("over", "under")
+        }
+        try:
+            predictor = ScorePredictor.from_odds(
+                odds_1x2,
+                odds_ou,
+                rho=rho,
+                max_goals=MAX_GOALS,
+                goals_line=GOALS_LINE,
+            )
+            predictor.fit()
+            prode = predictor.predict_for_prode()
+            top3_pure = prode["top3_pure"]
+            top3_diverse = prode["top3"]
+        except (ValueError, KeyError):
+            continue
+
+        metrics.n_matches += 1
+        if _top3_hit(top3_pure, fthg, ftag):
+            metrics.top3_pure_hits += 1
+        if _top3_hit(top3_diverse, fthg, ftag):
+            metrics.top3_diverse_hits += 1
+
+    return metrics
+
+
+def print_top3_coverage_comparison(mode_h: Top3CoverageMetrics) -> None:
+    width = 80
+    print()
+    print("=" * width)
+    print(
+        f"MODO H — Top-3 Coverage Accuracy — {mode_h.n_matches} partidos"
+    )
+    print("=" * width)
+    print(
+        f"\n{'Métrica':<36}{'Top-3 puro EPV':>18}{'Top-3 diversificado':>20}"
+    )
+    print("-" * width)
+    print(
+        f"{'Top-3 Coverage Accuracy':<36}"
+        f"{mode_h.top3_pure_acc * 100:>17.1f}%"
+        f"{mode_h.top3_diverse_acc * 100:>19.1f}%"
+    )
+    delta = (mode_h.top3_diverse_acc - mode_h.top3_pure_acc) * 100
+    sign = "+" if delta >= 0 else ""
+    print(
+        f"\nΔ Top-3 Coverage (H diversificado − puro EPV): {sign}{delta:.1f} pp"
+    )
+    print("=" * width)
 
 
 def print_report(
@@ -434,6 +680,34 @@ def print_prode_comparison(mode_a: ProdeMetrics, mode_g: ProdeMetrics, *, n_tota
         )
     else:
         print(f"EPV promedio G: {mode_g.avg_epv:.3f} pts/partido")
+    print("=" * width)
+
+
+def print_ah_curve_comparison(mode_g: ProdeMetrics, mode_j: ProdeMetrics, *, n_total: int) -> None:
+    width = 90
+    print()
+    print("=" * width)
+    print(f"MODO J — Curva AH vs Modo G (prode EPV) — {n_total} partidos")
+    print("=" * width)
+    print(
+        f"\n{'Modo':<28}{'Exact':>10}{'Pts avg':>10}{'λ_home':>16}{'λ_away':>16}"
+    )
+    print("-" * width)
+    for m in (mode_g, mode_j):
+        print(
+            f"{m.label:<28}"
+            f"{m.exact_acc * 100:>9.1f}%"
+            f"{m.avg_points:>10.3f}"
+            f"{m.lambda_home_mean:>8.3f}±{m.lambda_home_std:.3f}"
+            f"{m.lambda_away_mean:>8.3f}±{m.lambda_away_std:.3f}"
+        )
+    delta_exact = (mode_j.exact_acc - mode_g.exact_acc) * 100
+    delta_pts = mode_j.avg_points - mode_g.avg_points
+    sign = "+" if delta_exact >= 0 else ""
+    print(
+        f"\nΔ Exact Score (J − G): {sign}{delta_exact:.1f} pp | "
+        f"Δ Pts prode avg: {delta_pts:+.3f}"
+    )
     print("=" * width)
 
 
@@ -527,6 +801,21 @@ def main() -> int:
     mode_g = evaluate_mode_prode(valid, method="prode", rho=_DEFAULT_RHO)
     mode_g.label = "G: prode EPV"
     print_prode_comparison(mode_a_prode, mode_g, n_total=len(valid))
+
+    print(
+        f"\nEvaluando Modo H (top 3 diversificado vs puro EPV) "
+        f"sobre {len(valid)} partidos...",
+        file=sys.stderr,
+    )
+    mode_h = evaluate_mode_h(valid, rho=_DEFAULT_RHO)
+    print_top3_coverage_comparison(mode_h)
+
+    print(
+        f"\nEvaluando Modo J (curva AH sintética) vs G sobre {len(valid)} partidos...",
+        file=sys.stderr,
+    )
+    mode_j = evaluate_mode_j(valid, rho=_DEFAULT_RHO)
+    print_ah_curve_comparison(mode_g, mode_j, n_total=len(valid))
 
     return 0
 

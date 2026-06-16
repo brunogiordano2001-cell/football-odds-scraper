@@ -159,6 +159,38 @@ python -m football_odds_scraper.backtest /ruta/a/E0.csv -v --export resultados.c
 
 Usa columnas Bet365: `B365H`, `B365D`, `B365A`, `B365>2.5`, `B365<2.5` y resultados `FTHG`, `FTAG`.
 
+## Alertas Telegram (GitHub Actions)
+
+El workflow `.github/workflows/match_alerts.yml` corre cada **15 minutos** y envía un mensaje Telegram cuando un partido del Mundial empieza en **15–25 minutos** (~20 min de anticipación).
+
+### Secrets en GitHub
+
+En el repositorio: **Settings → Secrets and variables → Actions → New repository secret**
+
+| Secret | Descripción |
+|--------|-------------|
+| `ODDSPAPI_KEY` | API key de [OddsPapi](https://oddspapi.io) |
+| `TELEGRAM_TOKEN` | Token del bot de [@BotFather](https://t.me/BotFather) |
+| `TELEGRAM_CHAT_ID` | ID del chat o canal destino |
+
+Nunca commitear estos valores en el código. Solo configurarlos como secrets.
+
+### Ejecución manual
+
+```bash
+export ODDSPAPI_KEY=...
+export TELEGRAM_TOKEN=...
+export TELEGRAM_CHAT_ID=...
+pip install -e ".[app]" matplotlib
+python scripts/send_match_alerts.py
+```
+
+También podés disparar el workflow desde **Actions → Match Alerts → Run workflow**.
+
+El script reutiliza `ScorePredictor`, `extract_pinnacle_odds` y los snapshots del día (`scripts/snapshots/`) para adjuntar un gráfico de evolución si hay ≥ 2 puntos.
+
+Los fixture ya alertados se guardan en `scripts/sent_alerts.json` (cacheado entre runs de GitHub Actions).
+
 ## Tests
 
 ```bash

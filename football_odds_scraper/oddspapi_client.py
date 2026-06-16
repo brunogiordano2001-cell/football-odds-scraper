@@ -14,6 +14,8 @@ SOCCER_SPORT_ID = 10
 BOOKMAKER_PINNACLE = "pinnacle"
 FOOTBALL_OU_LINE_MIN = 0.5
 FOOTBALL_OU_LINE_MAX = 5.5
+FOOTBALL_AH_LINE_MIN = -6.0
+FOOTBALL_AH_LINE_MAX = 6.0
 FIXTURE_WINDOW_DAYS = 30
 ODDS_BY_TOURNAMENTS_EMPTY_MSG = (
     "No hay partidos próximos disponibles en este momento. "
@@ -316,6 +318,7 @@ def _parse_worldcup_fixture_with_odds(item: dict[str, Any]) -> dict[str, Any] | 
         "participant1Id": item.get("participant1Id"),
         "participant2Id": item.get("participant2Id"),
         "startTime": item.get("startTime"),
+        "statusId": item.get("statusId"),
         "hasOdds": item.get("hasOdds"),
         "tournamentId": item.get("tournamentId"),
         "tournamentName": item.get("tournamentName"),
@@ -513,14 +516,53 @@ def _is_full_time_totals_market(market_id: str) -> bool:
     return True
 
 
+_TT_HOME_LINE_PRIORITY = (0.5, 1.5, 2.5)
+_TT_AWAY_LINE_PRIORITY = (0.5, 1.5, 2.5, 3.5)
+
+
+def _parse_tt_outcome_label(label: str) -> tuple[str, float, str] | None:
+    """Parsea 'home/1.5/over' → ('home', 1.5, 'over')."""
+    text = label.strip().lower()
+    parts = text.split("/")
+    if len(parts) != 3:
+        return None
+    side, line_part, ou = parts
+    if side not in ("home", "away") or ou not in ("over", "under"):
+        return None
+    try:
+        line = float(line_part)
+    except ValueError:
+        return None
+    return side, line, ou
+
+
+def _pick_tt_side(
+    by_side_line: dict[tuple[str, float], dict[str, float]],
+    side: str,
+    line_priority: tuple[float, ...],
+) -> tuple[float | None, float | None, float | None]:
+    for line in line_priority:
+        prices = by_side_line.get((side, line), {})
+        over = prices.get("over")
+        under = prices.get("under")
+        if over is not None and under is not None:
+            return over, under, line
+    return None, None, None
+
+
 def _extract_team_totals(
     markets: dict[str, Any],
-) -> tuple[float | None, float | None, float | None, float | None, list[str]]:
-    """Team totals 0.5 exactos: home/0.5/over|under y away/0.5/over|under."""
-    tt_home_over: float | None = None
-    tt_home_under: float | None = None
-    tt_away_over: float | None = None
-    tt_away_under: float | None = None
+) -> tuple[
+    float | None,
+    float | None,
+    float | None,
+    float | None,
+    float | None,
+    float | None,
+    list[str],
+]:
+    """Team totals con fallback 0.5 → 1.5 → 2.5 (away también 3.5)."""
+    by_side_line: dict[tuple[str, float], dict[str, float]] = {}
     tt_outcome_ids_found: list[str] = []
 
     for market_data in markets.values():
@@ -536,24 +578,28 @@ def _extract_team_totals(
             price = _player_price(outcome_data)
             if price is None:
                 continue
-            if label.startswith(("home/", "away/")) and (
-                label.endswith("/over") or label.endswith("/under")
-            ):
-                tt_outcome_ids_found.append(label)
-            if label == "home/0.5/over":
-                tt_home_over = price
-            elif label == "home/0.5/under":
-                tt_home_under = price
-            elif label == "away/0.5/over":
-                tt_away_over = price
-            elif label == "away/0.5/under":
-                tt_away_under = price
+            parsed = _parse_tt_outcome_label(label)
+            if parsed is None:
+                continue
+            side, line, ou = parsed
+            tt_outcome_ids_found.append(label)
+            bucket = by_side_line.setdefault((side, line), {})
+            bucket[ou] = price
+
+    tt_home_over, tt_home_under, tt_home_line = _pick_tt_side(
+        by_side_line, "home", _TT_HOME_LINE_PRIORITY
+    )
+    tt_away_over, tt_away_under, tt_away_line = _pick_tt_side(
+        by_side_line, "away", _TT_AWAY_LINE_PRIORITY
+    )
 
     return (
         tt_home_over,
         tt_home_under,
         tt_away_over,
         tt_away_under,
+        tt_home_line,
+        tt_away_line,
         sorted(set(tt_outcome_ids_found)),
     )
 
@@ -615,7 +661,10 @@ def format_pinnacle_calibration(odds: dict[str, Any] | None) -> str:
         parts.append(f"O/U×{len(ou_curve)}")
     if odds.get("correct_score_odds"):
         parts.append("CS")
-    if odds.get("ah_line") is not None:
+    ah_curve = odds.get("ah_curve")
+    if isinstance(ah_curve, list) and len(ah_curve) >= 1:
+        parts.append(f"AH×{len(ah_curve)}")
+    elif odds.get("ah_line") is not None:
         parts.append("AH")
     if parts:
         return f"📊 {' + '.join(parts)}"
@@ -642,18 +691,43 @@ def _market_limit(market_data: dict[str, Any]) -> float:
         return 0.0
 
 
-def _extract_asian_handicap(
+def _is_full_time_spreads_market(market_id: str) -> bool:
+    mid = market_id.lower()
+    if "/1/" in mid or "/2/" in mid:
+        return False
+    return "spreads" in mid or "handicap" in mid
+
+
+def _ah_line_balance(home: float, away: float) -> float:
+    margin = 1.0 / home + 1.0 / away
+    p_home = 1.0 / home / margin
+    return abs(p_home - 0.5)
+
+
+def _filter_football_ah_curve(
+    curve: list[tuple[float, float, float]] | None,
+) -> list[tuple[float, float, float]] | None:
+    if not curve:
+        return None
+    filtered = [
+        (line, home, away)
+        for line, home, away in curve
+        if FOOTBALL_AH_LINE_MIN <= float(line) <= FOOTBALL_AH_LINE_MAX
+    ]
+    return filtered if filtered else None
+
+
+def _extract_ah_curve(
     markets: dict[str, Any],
-) -> tuple[float | None, float | None, float | None]:
-    """AH principal: market handicap con mayor limit y exactamente 2 outcomes."""
-    best_limit = -1.0
-    best: tuple[float, float, float] | None = None
+) -> list[tuple[float, float, float]] | None:
+    """Curva AH full-time: [(línea, home, away), ...] ordenada por línea."""
+    by_line: dict[float, tuple[float, float, float, float]] = {}
 
     for market_data in markets.values():
         if not isinstance(market_data, dict):
             continue
         market_id = str(market_data.get("bookmakerMarketId", ""))
-        if "handicap" not in market_id.lower():
+        if not _is_full_time_spreads_market(market_id):
             continue
 
         outcomes = market_data.get("outcomes", {})
@@ -671,29 +745,93 @@ def _extract_asian_handicap(
             price = _player_price(outcome_data)
             if price is None:
                 continue
+            parsed = _parse_handicap_line(label)
             if label.endswith("/home"):
                 ah_home = price
-                parsed = _parse_handicap_line(label)
                 if parsed is not None:
                     ah_line = parsed
             elif label.endswith("/away"):
                 ah_away = price
-                if ah_line is None:
-                    parsed = _parse_handicap_line(label)
-                    if parsed is not None:
-                        ah_line = parsed
+                if ah_line is None and parsed is not None:
+                    ah_line = parsed
 
         if ah_line is None or ah_home is None or ah_away is None:
             continue
+        if not (FOOTBALL_AH_LINE_MIN <= ah_line <= FOOTBALL_AH_LINE_MAX):
+            continue
 
         limit_val = _market_limit(market_data)
-        if limit_val >= best_limit:
-            best_limit = limit_val
-            best = (ah_line, ah_home, ah_away)
+        prev = by_line.get(ah_line)
+        if prev is None or limit_val >= prev[3]:
+            by_line[ah_line] = (ah_line, ah_home, ah_away, limit_val)
 
-    if best is None:
-        return None, None, None
-    return best
+    curve = [(line, home, away) for line, home, away, _ in sorted(by_line.values())]
+    return curve if curve else None
+
+
+def _main_ah_from_curve(
+    ah_curve: list[tuple[float, float, float]],
+    *,
+    markets: dict[str, Any] | None = None,
+) -> tuple[float, float, float]:
+    """Línea principal: mainLine=true si existe, si no la más balanceada."""
+    if markets:
+        for market_data in markets.values():
+            if not isinstance(market_data, dict):
+                continue
+            if market_data.get("mainLine") is not True:
+                continue
+            market_id = str(market_data.get("bookmakerMarketId", ""))
+            if not _is_full_time_spreads_market(market_id):
+                continue
+            outcomes = market_data.get("outcomes", {})
+            if not isinstance(outcomes, dict) or len(outcomes) != 2:
+                continue
+            ah_line: float | None = None
+            ah_home: float | None = None
+            ah_away: float | None = None
+            for outcome_data in outcomes.values():
+                if not isinstance(outcome_data, dict):
+                    continue
+                label = _bookmaker_outcome_label(outcome_data).lower()
+                price = _player_price(outcome_data)
+                if price is None:
+                    continue
+                parsed = _parse_handicap_line(label)
+                if label.endswith("/home"):
+                    ah_home = price
+                    if parsed is not None:
+                        ah_line = parsed
+                elif label.endswith("/away"):
+                    ah_away = price
+                    if ah_line is None and parsed is not None:
+                        ah_line = parsed
+            if ah_line is not None and ah_home is not None and ah_away is not None:
+                return ah_line, ah_home, ah_away
+
+    line, home, away = min(
+        ah_curve,
+        key=lambda item: _ah_line_balance(item[1], item[2]),
+    )
+    return line, home, away
+
+
+def _resolve_main_ah_and_curve(
+    markets: dict[str, Any],
+) -> tuple[float | None, float | None, float | None, list[tuple[float, float, float]] | None]:
+    ah_curve = _filter_football_ah_curve(_extract_ah_curve(markets))
+    if ah_curve:
+        line, home, away = _main_ah_from_curve(ah_curve, markets=markets)
+        return line, home, away, ah_curve
+    return None, None, None, None
+
+
+def _extract_asian_handicap(
+    markets: dict[str, Any],
+) -> tuple[float | None, float | None, float | None]:
+    """AH principal desde curva filtrada (-6..+6) o None si no hay mercado."""
+    line, home, away, _ = _resolve_main_ah_and_curve(markets)
+    return line, home, away
 
 
 def format_pinnacle_ah(odds: dict[str, Any] | None) -> str:
@@ -800,6 +938,34 @@ def parse_correct_score_input(text: str) -> dict[tuple[int, int], float] | None:
     return cs_odds if len(cs_odds) >= 3 else None
 
 
+def parse_ah_curve_input(text: str) -> list[tuple[float, float, float]] | None:
+    """Parsea '-0.25:1.83/2.12, -0.5:2.14/1.79' → [(línea, home, away), ...]."""
+    if not text or not str(text).strip():
+        return None
+    curve: list[tuple[float, float, float]] = []
+    for part in str(text).split(","):
+        chunk = part.strip()
+        if not chunk or ":" not in chunk:
+            continue
+        line_part, _, prices = chunk.partition(":")
+        if "/" not in prices:
+            continue
+        home_part, _, away_part = prices.partition("/")
+        try:
+            line = float(line_part.strip().replace("+", ""))
+            home = float(home_part.strip())
+            away = float(away_part.strip())
+        except (TypeError, ValueError):
+            continue
+        if home > 1.0 and away > 1.0:
+            if FOOTBALL_AH_LINE_MIN <= line <= FOOTBALL_AH_LINE_MAX:
+                curve.append((line, home, away))
+    if not curve:
+        return None
+    curve.sort(key=lambda item: item[0])
+    return curve
+
+
 def parse_ou_curve_input(text: str) -> list[tuple[float, float, float]] | None:
     """Parsea '1.5:1.48/2.73, 2.0:1.87/2.04' → [(línea, over, under), ...]."""
     if not text or not str(text).strip():
@@ -850,7 +1016,7 @@ def extract_pinnacle_odds(bookmaker_odds: dict[str, Any]) -> dict[str, float | N
 
     Retorna dict con keys: home, draw, away, over, under, ah_line, ah_home, ah_away,
     correct_score_odds, tt_home_over, tt_home_under, tt_away_over, tt_away_under,
-    ou_curve (opcionales).
+    ou_curve, ah_curve (opcionales).
     Retorna None si falta alguna de las 5 odds 1X2/O/U.
     AH es opcional (None si no está disponible).
     """
@@ -867,17 +1033,19 @@ def extract_pinnacle_odds(bookmaker_odds: dict[str, Any]) -> dict[str, float | N
     if None in (home, draw, away, over, under, main_line):
         return None
 
-    ah_line, ah_home, ah_away = _extract_asian_handicap(markets)
+    ah_line, ah_home, ah_away, ah_curve = _resolve_main_ah_and_curve(markets)
     correct_score_odds = _extract_correct_score(markets)
-    tt_home_over, tt_home_under, tt_away_over, tt_away_under, tt_outcome_ids = (
+    tt_home_over, tt_home_under, tt_away_over, tt_away_under, tt_home_line, tt_away_line, tt_outcome_ids = (
         _extract_team_totals(markets)
     )
 
     print("=== TT DEBUG ===")
     print(f"  tt_home_over outlet: {tt_home_over}")
     print(f"  tt_home_under outlet: {tt_home_under}")
+    print(f"  tt_home_line: {tt_home_line}")
     print(f"  tt_away_over outlet: {tt_away_over}")
     print(f"  tt_away_under outlet: {tt_away_under}")
+    print(f"  tt_away_line: {tt_away_line}")
     print(f"  bookmakerOutcomeIds encontrados para TT: {tt_outcome_ids}")
 
     return {
@@ -895,7 +1063,10 @@ def extract_pinnacle_odds(bookmaker_odds: dict[str, Any]) -> dict[str, float | N
         "tt_home_under": tt_home_under,
         "tt_away_over": tt_away_over,
         "tt_away_under": tt_away_under,
+        "tt_home_line": tt_home_line,
+        "tt_away_line": tt_away_line,
         "ou_curve": ou_curve,
+        "ah_curve": ah_curve,
     }
 
 
@@ -1044,6 +1215,15 @@ def parse_fixture_start_datetime(start_time: Any) -> datetime | None:
         return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
     except ValueError:
         return None
+
+
+def fixture_is_finished(fixture: dict[str, Any]) -> bool:
+    """True si el partido terminó (statusId=2 en OddsPapi)."""
+    status = fixture.get("statusId")
+    try:
+        return int(status) == 2
+    except (TypeError, ValueError):
+        return False
 
 
 def fixture_has_started(
